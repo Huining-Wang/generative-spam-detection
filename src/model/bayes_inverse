@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+
+"""
+Minimal bayes inverse example for SmolLM2-135M-Instruct.
+
+Filepath: ./examples/bayes_inverse_example.py
+Project: CPEN455-Project-2025W1
+Description: integrates three different ways to perform bayes inverse classification with LLMs for spam detection.
+
+Usage:
+    uv run -m examples.bayes_inverse
+"""
+
+import os
+import argparse
+
+import wandb
+from dotenv import load_dotenv
+from einops import rearrange
+from tqdm import tqdm
+
+import torch
+from torch.utils.data import DataLoader
+from torch.nn import functional as F
+
+from autograder.dataset import (
+    CPEN455_2025_W1_Dataset,
+    ENRON_LABEL_INDEX_MAP,
+    prepare_subset,
+)
+from model import LlamaModel
+from utils.weight_utils import load_model_weights
+from model.config import Config
+from model.tokenizer import Tokenizer
+from utils.download import _resolve_snapshot_path
+from utils.device import set_device
+from utils.prompt_template import get_prompt
+from utils.logger import avg_logger, avg_acc_logger
+
+
+def get_seq_log_prob(prompts, tokenizer, model, device):
+    encoded_batch = tokenizer.encode(
+        prompts, return_tensors="pt", return_attention_mask=True
+    )
+
+    input_ids = encoded_batch["input_ids"].to(device)
+    attention_mask = encoded_batch["attention_mask"].to(device)
+
+    log_prob, _ = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    )
+
+    shifted_log_prob = log_prob[:, :-1, :]
+    shifted_input_ids = input_ids[:, 1:]
+    shifted_attention_mask = attention_mask[:, 1:]
+
+    gathered_log_prob = shifted_log_prob.gather(
+        -1, shifted_input_ids.unsqueeze(-1)
+    ).squeeze(-1)
+    gathered_log_prob = gathered_log_prob * shifted_attention_mask
+
+    return gathered_log_prob.sum(dim=-1)
+
+
+METHOD_SET = ["zero_shot", "naive_prompting", "full_finetune"]
+
+
+def is_required_training(method: str) -> bool:
+    assert method in METHOD_SET, f"Method {method} not recognized. Choose from {METHOD_SET}."
+    return method in METHOD_SET[2:]
+
+
+def bayes_inverse_llm_classifier(args, model, batch, tokenizer, device):
+    _, subjects, messages, labels = batch
+
+    prompts_ham = [
+        get_prompt(
+            subject=subj,
+            message=msg,
+            label=ENRON_LABEL_INDEX_MAP.inv[0],
+            max_seq_length=args.max_seq_len,
+            user_prompt=args.user_prompt,
+        )
+        for subj, msg in zip(subjects, messages)
+    ]
+    prompts_spam = [
+        get_prompt(
+            subject=subj,
+            message=msg,
+            label=ENRON_LABEL_INDEX_MAP.inv[1],
+            max_seq_length=args.max_seq_len,
+            user_prompt=args.user_prompt,
+        )
+        for subj, msg in zip(subjects, messages)
+    ]
+
+    # The first half are ham, the second half are spam
+    prompts = prompts_ham + prompts_spam
+    with torch.no_grad():
+        seq_log_prob = get_seq_log_prob(prompts, tokenizer, model, device)
+
+        seq_log_prob = rearrange(seq_log_prob, "(c b) -> b c", c=2)
+
+        probs = F.softmax(seq_log_prob, dim=-1)
+
+        labels_pred = torch.argmax(probs, dim=-1)
+
+        if -1 in labels:
+            is_correct = None
+        else:
+            is_correct = labels_pred.cpu() == labels
+
+        return is_correct, (probs.detach().cpu(), labels_pred.detach().cpu())
+
+
+def train_or_test(args, model, tokenizer, batch, device, optimizer=None, is_training=True):
+    if is_training:
+        model.train()
+    else:
+        model.eval()
+
+    _, subjects, messages, label_indexs = batch
+
+    if -1 in label_indexs:
+        bpd = None
+    else:
+        labels_text = [
+            ENRON_LABEL_INDEX_MAP.inv[int(label_index)]
+            for label_index in label_indexs
+        ]
+
+        prompts = [
+            get_prompt(
+                subject=subj,
+                message=msg,
+                label=label,
+                max_seq_length=args.max_seq_len,
+                user_prompt=args.user_prompt,
+            )
+            for subj, msg, label in zip(subjects, messages, labels_text)
+        ]
+
+        seq_log_prob = get_seq_log_prob(prompts, tokenizer, model, device=device)
+
+        num_characters = torch.tensor(
+            [len(prompt) for prompt in prompts], device=device
+        ).sum()
+        bpd = -seq_log_prob.sum() / num_characters
+
+        if is_training:
+            assert optimizer is not None, "Optimizer must be provided during training."
+            optimizer.zero_grad()
+            bpd.backward()
+            optimizer.step()
+
+    is_correct, (probs, labels_pred) = bayes_inverse_llm_classifier(
+        args, model, batch, tokenizer, device=device
+    )
+
+    return bpd, is_correct, (probs, labels_pred)
+
+
+def save_probs(args, model, tokenizer, dataloader, device, name="test"):
+    model.eval()
+
+    save_path = os.path.join(
+        os.getcwd(), f"{args.prob_output_folder}/{name}_dataset_probs.csv"
+    )
+
+    if os.path.exists(save_path):
+        os.remove(save_path)
+
+    with torch.no_grad():
+        for batch in tqdm(dataloader, desc=f"saving probabilities ({name})"):
+            _, (probs, _) = bayes_inverse_llm_classifier(
+                args, model, batch, tokenizer, device=device
+            )
+
+            data_index, _, _, _ = batch
+            indices = torch.as_tensor(data_index).view(-1).tolist()
+
+            rows = zip(indices, probs[:, 0].tolist(), probs[:, 1].tolist())
+
+            file_exists = os.path.exists(save_path)
+            with open(save_path, "a", newline="") as handle:
+                if not file_exists:
+                    handle.write("data_index,prob_ham,prob_spam\n")
+                handle.writelines(
+                    f"{idx},{ham},{spam}\n" for idx, ham, spam in rows
+                )
+
+
+if __name__ == "__main__":
+    
+    torch.manual_seed(0)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--method", type=str, default="zero_shot", choices=METHOD_SET)
+
+    parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--max_seq_len", type=int, default=256)
+    parser.add_argument("--dataset_path",type=str,default="autograder/cpen455_released_datasets/train_val_subset.csv",)
+    parser.add_argument("--test_dataset_path",type=str,default="autograder/cpen455_released_datasets/test_subset.csv",)
+    parser.add_argument("--prob_output_folder", type=str, default="bayes_inverse_probs")
+    parser.add_argument("--user_prompt", type=str, default="")
+
+    # Training hyperparameters
+    parser.add_argument("--num_iterations", type=int, default=100)
+    parser.add_argument("--learning_rate", type=float, default=1e-4)
+
+    # Checkpointing
+    parser.add_argument("--resume_from",type=str,default=None,help="Path to a checkpoint file to resume training from.",)
+    parser.add_argument("--checkpoint_path",type=str,default="checkpoints/bayes_inverse_checkpoint.pt",help="Path to save the best checkpoint during training.",)
+
+    args = parser.parse_args()
+
+    load_dotenv()
+
+    checkpoint = os.getenv("MODEL_CHECKPOINT")
+    model_cache_dir = os.getenv("MODEL_CACHE_DIR")
+
+    if not is_required_training(args.method):
+        run = wandb.init(
+            project=os.getenv("PROJECT_NAME"),
+            name=f"bayes-inverse-{args.method}_msl{args.max_seq_len}",
+        )
+    else:
+        run = wandb.init(
+            project=os.getenv("PROJECT_NAME"),
+            name=(
+                f"bayes-inverse-{args.method}_"
+                f"msl{args.max_seq_len}_ni{args.num_iterations}_bs{args.batch_size}"
+            ),
+        )
+
+    wandb.config.update(args)
+
+    # Set device to GPU if available, to MPS if on Mac with M-series chip, else CPU
+    device = set_device()
+
+    # Load tokenizer and config
+    tokenizer = Tokenizer.from_pretrained(checkpoint, cache_dir=model_cache_dir)
+
+    base_path = _resolve_snapshot_path(checkpoint, cache_dir=model_cache_dir)
+    config = Config._find_config_files(base_path)
+
+    # Load model
+    model = LlamaModel(config)
+    load_model_weights(model, checkpoint, cache_dir=model_cache_dir, device=device)
+    model = model.to(device)
+
+    # Optimizer，update the hyperparameters 
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    
+    # Be careful 
+    # This part is for the system to resume check point, important.
+    global_step = 0
+    if args.resume_from is not None and os.path.exists(args.resume_from):
+        ckpt = torch.load(args.resume_from, map_location=device)
+        if "model_state" in ckpt:
+            model.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        if "global_step" in ckpt:
+            global_step = int(ckpt["global_step"])
+        print(f"Resumed from checkpoint: {args.resume_from} (global_step={global_step})")
+
+        # Update the learning rate I have set. 
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = args.learning_rate
+        print(f"Reset optimizer learning rate to {args.learning_rate}")
+    else:
+        print("No checkpoint resume. Starting from scratch.")
+        global_step = 0
+
+    # Set up datasets and dataloaders
+    train_n_val_dataset = CPEN455_2025_W1_Dataset(csv_path=args.dataset_path)
+    training_dataset, val_dataset = prepare_subset(train_n_val_dataset,int(0.8 * len(train_n_val_dataset)),ratio_spam=0.5,return_remaining=True,)
+    test_dataset = CPEN455_2025_W1_Dataset(csv_path=args.test_dataset_path)
+
+    training_dataloader = DataLoader(
+        training_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+    )
+
+    val_dataloader = DataLoader(
+        val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    test_dataloader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+
+    if not os.path.exists(args.prob_output_folder):
+        os.makedirs(args.prob_output_folder)
+
+    # This is an initialization of acc and bpd. The real results will not be that bad any more. 
+    best_val_acc = -1.0
+    best_val_bpd = 1e9
+
+
+    # Training loop (only for full_finetune)
+
+    if args.method == "full_finetune":
+        while global_step < args.num_iterations:
+            for batch in training_dataloader:
+                if global_step >= args.num_iterations:
+                    break  # done training
+
+                bpd, is_correct, (probs, labels_pred) = train_or_test(
+                    args=args,
+                    model=model,
+                    tokenizer=tokenizer,
+                    batch=batch,
+                    device=device,
+                    optimizer=optimizer,
+                    is_training=True,
+                )
+
+                if bpd is not None and is_correct is not None:
+                    wandb.log(
+                        {
+                            "training_batch_bpd": bpd.item(),
+                            "training_batch_acc": is_correct.float().mean().item(),
+                            "training_iteration": global_step,
+                        }
+                    )
+
+                if (global_step + 1) % 10 == 0: #Each ten step, we'll have a test. About Accuracy and BPD.Useful information 
+                    val_acc_logger = avg_acc_logger()
+                    val_bpd_logger = avg_logger()
+
+                    with torch.no_grad():
+                        for val_batch in val_dataloader:
+                            val_bpd, val_is_correct, _ = train_or_test(
+                                args=args,
+                                model=model,
+                                tokenizer=tokenizer,
+                                batch=val_batch,
+                                device=device,
+                                is_training=False,
+                            )
+                            if val_bpd is not None and val_is_correct is not None:
+                                val_acc_logger.update(val_is_correct)
+                                val_bpd_logger.update(val_bpd.item())
+
+                    val_acc = val_acc_logger.compute_accuracy()
+                    val_bpd = val_bpd_logger.compute_average()
+
+                    print(
+                        f"[VAL] step {global_step+1}: "
+                        f"acc={val_acc:.3f}, bpd={val_bpd:.4f}"
+                    )
+
+                    wandb.log(
+                        {
+                            "val_avg_accuracy": val_acc,
+                            "val_avg_bpd": val_bpd,
+                            "training_iteration": global_step,
+                        }
+                    )
+
+                    # Two-criteria for best model selection:
+                    # 1) Higher validation accuracy is better. If it becomes 1 saturated, then we'll focus on BPD 
+                    # 2) If accuracy is effectively tied, lower bpd is better.
+                    if args.checkpoint_path is not None:
+                        eps = 1e-6
+                        is_better = False
+
+                        if val_acc > best_val_acc + eps:
+                            is_better = True
+                        elif abs(val_acc - best_val_acc) <= eps and val_bpd < best_val_bpd:
+                            is_better = True
+
+                        if is_better:
+                            best_val_acc = val_acc
+                            best_val_bpd = val_bpd
+
+                            ckpt_dir = os.path.dirname(args.checkpoint_path)
+                            if ckpt_dir != "" and not os.path.exists(ckpt_dir):
+                                os.makedirs(ckpt_dir, exist_ok=True)
+                            torch.save(
+                                {
+                                    "model_state": model.state_dict(),
+                                    "optimizer_state": optimizer.state_dict(),
+                                    "global_step": global_step,
+                                    "args": vars(args),
+                                    "best_val_acc": best_val_acc,
+                                    "best_val_bpd": best_val_bpd,
+                                },
+                                args.checkpoint_path,
+                            )
+                            print(
+                                f"New best model saved to {args.checkpoint_path} "
+                                f"(val_acc={best_val_acc:.3f}, bpd={best_val_bpd:.4f})"
+                            )
+
+                global_step += 1
+    else:
+        print(f"Method '{args.method}' selected: no training will be performed.")
+
+    # This is used for loading check point.For a model furthur training 
+
+    if args.checkpoint_path is not None and os.path.exists(args.checkpoint_path):
+        ckpt = torch.load(args.checkpoint_path, map_location=device)
+        if "model_state" in ckpt:
+            model.load_state_dict(ckpt["model_state"])
+            print(
+                f"Loaded best model from {args.checkpoint_path} "
+                "for final evaluation and probability saving."
+            )
+        if "best_val_acc" in ckpt:
+            best_val_acc = ckpt["best_val_acc"]
+        if "best_val_bpd" in ckpt:
+            best_val_bpd = ckpt["best_val_bpd"]
+        print(
+            f"Best validation metrics recorded: "
+            f"acc={best_val_acc:.3f}, bpd={best_val_bpd:.4f}"
+        )
+    else:
+        print(
+            "Best checkpoint not found; using current model for final evaluation "
+            "and probability saving."
+        )
+
+ 
+    # This part I run a full pass over the validation set to compute and report the final accuracy and BPD.
+  
+    model.eval()
+    final_val_acc_logger = avg_acc_logger()
+    final_val_bpd_logger = avg_logger()
+    with torch.no_grad():
+        for batch in tqdm(val_dataloader, desc="Final evaluation on validation set"):
+            bpd, is_correct, _ = train_or_test(
+                args=args,
+                model=model,
+                tokenizer=tokenizer,
+                batch=batch,
+                device=device,
+                is_training=False,
+            )
+            if bpd is not None and is_correct is not None:
+                final_val_acc_logger.update(is_correct)
+                final_val_bpd_logger.update(bpd.item())
+
+    final_val_acc = final_val_acc_logger.compute_accuracy()
+    final_val_bpd = final_val_bpd_logger.compute_average()
+    print(f"[FINAL VAL] acc={final_val_acc:.3f}, bpd={final_val_bpd:.4f}")  # This is used to show the final BPD and ACC
+    wandb.log(
+        {
+            "final_val_accuracy": final_val_acc,
+            "final_val_bpd": final_val_bpd,
+        })
+
+    # After training/evaluation, save probabilities on train+val and test set
+
+    train_n_val_dataloader = DataLoader(
+        train_n_val_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+    )
+    save_probs(args,model,tokenizer,train_n_val_dataloader,device=device,name="train_n_val",)
+    save_probs(args,model,tokenizer,test_dataloader,device=device,name="test",)
