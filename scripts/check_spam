@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+import os
+import sys
+
+# Allow duplicate OpenMP libraries (avoids libiomp5md.dll conflict on Windows)
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+# Add project root to sys.path so we can import model, utils, etc.
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+from dotenv import load_dotenv
+
+from model import LlamaModel
+from model.tokenizer import Tokenizer
+from model.config import Config
+from utils.download import _resolve_snapshot_path
+from utils.weight_utils import load_model_weights
+from utils.device import set_device
+from utils.sample import sample
+
+
+def extract_assistant_reply(decoded_text: str) -> str:
+    """
+    Extract the last assistant reply from the decoded text.
+    Supports ChatML-like templates with <|im_start|>assistant ... <|im_end|>.
+    Falls back to the whole decoded string if no markers are found.
+    """
+    # Preferred: ChatML-style blocks
+    if "<|im_start|>assistant" in decoded_text:
+        # Take the last assistant block
+        part = decoded_text.rsplit("<|im_start|>assistant", 1)[1]
+        if "<|im_end|>" in part:
+            reply = part.split("<|im_end|>", 1)[0].strip()
+        else:
+            reply = part.strip()
+        return reply
+
+    # Fallback: older templates that use <|assistant|>
+    if "<|assistant|>" in decoded_text:
+        reply = decoded_text.split("<|assistant|>", 1)[1].strip()
+        return reply
+
+    # Last resort: return the whole string
+    return decoded_text.strip()
+
+
+if __name__ == "__main__":
+    load_dotenv()
+
+    checkpoint = os.getenv("MODEL_CHECKPOINT")
+    model_cache_dir = os.getenv("MODEL_CACHE_DIR")
+
+    device = set_device()
+    print(f"Using device: {device}")
+
+    # Load tokenizer / config / model
+    tokenizer = Tokenizer.from_pretrained(checkpoint, cache_dir=model_cache_dir)
+    base_path = _resolve_snapshot_path(checkpoint, cache_dir=model_cache_dir)
+    config = Config._find_config_files(base_path)
+
+    model = LlamaModel(config)
+    load_model_weights(model, checkpoint, cache_dir=model_cache_dir, device=device)
+    model = model.to(device)
+    model.eval()
+
+    print("Spam checker ready! Type an email body, I will classify it as spam or ham.")
+    print("Type 'exit' to quit.\n")
+
+    while True:
+        email_text = input("Email> ")
+        if email_text.strip().lower() == "exit":
+            break
+
+        # Build a simple classification-style prompt
+        prompt = (
+            "You are an email spam classifier. "
+            "Classify the following email as either 'spam' or 'ham' "
+            "and reply with exactly one word: spam or ham.\n\n"
+            f"Email:\n{email_text}\n"
+        )
+
+        messages = [
+            {"role": "user", "content": prompt}
+        ]
+
+        input_text = tokenizer.apply_chat_template(messages, tokenize=False)
+        inputs = tokenizer.encode(input_text, return_tensors="pt").to(device)
+
+        outputs = sample(
+            model,
+            inputs,
+            max_new_tokens=32,
+            temperature=0.2,
+            top_p=0.9,
+            do_sample=True,
+        )
+
+        decoded = tokenizer.decode(outputs[0])
+        reply = extract_assistant_reply(decoded)
+
+        # Take the first word of the reply and normalize
+        reply_first = reply.split()[0].lower() if reply else ""
+
+        if "spam" in reply_first:
+            label = "spam"
+        elif "ham" in reply_first:
+            label = "ham"
+        else:
+            label = f"uncertain (raw model output: {reply})"
+
+        print(f"Model reply: {reply}")
+        print(f"→ Predicted label: {label}\n")
